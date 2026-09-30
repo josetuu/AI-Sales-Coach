@@ -1,93 +1,129 @@
-import "server-only"
-import { createHash } from "node:crypto"
+import 'server-only'
+import { getToken, startAuthorization, UserAuthorizationRequiredError, NoValidTokenError } from '@vercel/connect'
+import { HttpError } from '@/lib/session'
+import { getOrigin } from '@/lib/google'
 
-const SERVER = "https://platform.ringcentral.com"
+const RINGCENTRAL_CONNECTOR_UID = 'platform.ringcentral.com/dialer-ringcentral'
+const RC_BASE = 'https://platform.ringcentral.com/restapi/v1.0'
+const RC_SCOPES = ['RingOut', 'ReadAccounts', 'VoipCalling']
 
-let cached: { token: string; expires: number } | null = null
-
-async function getToken() {
-  if (cached && cached.expires > Date.now() + 60_000) return cached.token
-  const basic = Buffer.from(`${process.env.RINGCENTRAL_CLIENT_ID}:${process.env.RINGCENTRAL_CLIENT_SECRET}`).toString("base64")
-  const res = await fetch(`${SERVER}/restapi/oauth/token`, {
-    method: "POST",
-    headers: { Authorization: `Basic ${basic}`, "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
-      assertion: process.env.RINGCENTRAL_JWT ?? "",
-    }),
-    cache: "no-store",
-  })
-  const data = await res.json()
-  if (!res.ok) throw new Error(`RingCentral rechazó las credenciales: ${data.error_description ?? res.status}`)
-  cached = { token: data.access_token, expires: Date.now() + data.expires_in * 1000 }
-  return cached.token
+function subject(userId: string) {
+  return { type: 'user' as const, id: userId }
 }
 
-async function rc(path: string, init?: RequestInit) {
-  const res = await fetch(path.startsWith("http") ? path : `${SERVER}${path}`, {
-    ...init,
-    headers: { ...init?.headers, Authorization: `Bearer ${await getToken()}` },
-    cache: "no-store",
-  })
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}))
-    if (body.permissionName) {
-      throw new Error(`Falta el permiso "${body.permissionName}" en tu app de RingCentral (developers.ringcentral.com).`)
+async function rcToken(userId: string) {
+  try {
+    return await getToken(RINGCENTRAL_CONNECTOR_UID, { subject: subject(userId), scopes: RC_SCOPES })
+  } catch (error) {
+    if (error instanceof UserAuthorizationRequiredError || error instanceof NoValidTokenError) {
+      throw new HttpError(403, 'Conecta tu cuenta de RingCentral para continuar', 'RC_AUTH_REQUIRED')
     }
-    throw new Error(body.message ?? `Error de RingCentral (${res.status})`)
+    console.error('[ringcentral] token error', error instanceof Error ? error.message : error)
+    throw new HttpError(503, 'RingCentral no está disponible. Revisa el conector.', 'RC_UNAVAILABLE')
   }
-  return res
 }
 
-export type Extension = { id: string; extensionNumber: string; name: string }
-
-export async function listExtensions(): Promise<Extension[]> {
-  const res = await rc("/restapi/v1.0/account/~/extension?type=User&status=Enabled&perPage=500")
-  const data = await res.json()
-  return data.records.map((r: { id: number; extensionNumber: string; name: string }) => ({
-    id: String(r.id),
-    extensionNumber: r.extensionNumber,
-    name: r.name,
-  }))
+export async function startRingCentralAuthorization(userId: string) {
+  const origin = await getOrigin()
+  const { url } = await startAuthorization(
+    RINGCENTRAL_CONNECTOR_UID,
+    { subject: subject(userId), scopes: RC_SCOPES },
+    { callbackUrl: `${origin}/dashboard?ringcentral=connected` },
+  )
+  return url
 }
 
-export type RcCall = {
+async function rcFetch<T>(userId: string, path: string, init?: RequestInit): Promise<T> {
+  const token = await rcToken(userId)
+  const res = await fetch(`${RC_BASE}${path}`, {
+    ...init,
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', ...init?.headers },
+    cache: 'no-store',
+  })
+  if (res.status === 204) return undefined as T
+  if (!res.ok) {
+    const body = await res.text()
+    console.error('[ringcentral] request failed', res.status, body.slice(0, 300))
+    if (res.status === 401) throw new HttpError(403, 'La sesión de RingCentral expiró', 'RC_AUTH_REQUIRED')
+    if (res.status === 404) throw new HttpError(404, 'La llamada ya no existe en RingCentral')
+    throw new HttpError(502, 'RingCentral rechazó la solicitud. Verifica los números.')
+  }
+  return res.json() as Promise<T>
+}
+
+export type RingOutStatus = {
   id: string
-  startTime: string
-  duration: number
-  direction: string
-  from?: { phoneNumber?: string; name?: string }
-  to?: { phoneNumber?: string; name?: string }
-  recording?: { id: string; contentUri: string }
-}
-
-export async function listRecordedCalls(extensionId: string, days = 7): Promise<RcCall[]> {
-  const dateFrom = new Date(Date.now() - days * 86_400_000).toISOString()
-  const q = new URLSearchParams({ type: "Voice", withRecording: "true", view: "Simple", perPage: "100", dateFrom })
-  const res = await rc(`/restapi/v1.0/account/~/extension/${extensionId}/call-log?${q}`)
-  const data = await res.json()
-  return data.records
-}
-
-export async function downloadRecording(contentUri: string) {
-  const res = await rc(contentUri)
-  return {
-    data: new Uint8Array(await res.arrayBuffer()),
-    mediaType: res.headers.get("content-type")?.split(";")[0] || "audio/mpeg",
+  status: {
+    callStatus: string
+    callerStatus?: string
+    calleeStatus?: string
   }
 }
 
-export const webhookVerificationToken = () =>
-  createHash("sha256").update(`${process.env.BETTER_AUTH_SECRET}:rc-webhook`).digest("hex").slice(0, 32)
+export function normalizePhone(raw: string) {
+  const trimmed = raw.trim()
+  const digits = trimmed.replace(/[^\d]/g, '')
+  if (!digits) return null
+  if (trimmed.startsWith('+')) return `+${digits}`
+  if (digits.length === 10) return `+1${digits}`
+  return `+${digits}`
+}
 
-export async function subscribeToCalls(extensionId: string, address: string) {
-  await rc("/restapi/v1.0/subscription", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
+export async function getRingCentralProfile(userId: string) {
+  const [ext, numbers] = await Promise.all([
+    rcFetch<{ name: string; extensionNumber: string }>(userId, '/account/~/extension/~'),
+    rcFetch<{ records: { phoneNumber: string; usageType: string; features?: string[] }[] }>(
+      userId,
+      '/account/~/extension/~/phone-number?perPage=100',
+    ),
+  ])
+  return {
+    name: ext.name,
+    extension: ext.extensionNumber,
+    phoneNumbers: numbers.records.map((r) => ({
+      phoneNumber: r.phoneNumber,
+      usageType: r.usageType,
+      callerId: r.features?.includes('CallerId') ?? false,
+    })),
+  }
+}
+
+export async function provisionSip(userId: string) {
+  try {
+    const res = await rcFetch<{ sipInfo: Record<string, unknown>[] }>(userId, '/client-info/sip-provision', {
+      method: 'POST',
+      body: JSON.stringify({ sipInfo: [{ transport: 'WSS' }] }),
+    })
+    const sipInfo = res.sipInfo?.[0]
+    if (!sipInfo) throw new HttpError(502, 'RingCentral no devolvió datos del teléfono web')
+    return sipInfo
+  } catch (error) {
+    if (error instanceof HttpError && error.status === 502) {
+      throw new HttpError(
+        502,
+        'RingCentral no permitió activar el teléfono web. Agrega el permiso "VoIP Calling" a tu app de RingCentral y vuelve a conectar.',
+        'RC_WEBPHONE_DENIED',
+      )
+    }
+    throw error
+  }
+}
+
+export async function startRingOut(userId: string, from: string, to: string) {
+  return rcFetch<RingOutStatus>(userId, '/account/~/extension/~/ring-out', {
+    method: 'POST',
     body: JSON.stringify({
-      eventFilters: [`/restapi/v1.0/account/~/extension/${extensionId}/telephony/sessions`],
-      deliveryMode: { transportType: "WebHook", address, verificationToken: webhookVerificationToken() },
-      expiresIn: 630720000,
+      from: { phoneNumber: from },
+      to: { phoneNumber: to },
+      playPrompt: false,
     }),
   })
+}
+
+export async function getRingOut(userId: string, id: string) {
+  return rcFetch<RingOutStatus>(userId, `/account/~/extension/~/ring-out/${encodeURIComponent(id)}`)
+}
+
+export async function cancelRingOut(userId: string, id: string) {
+  return rcFetch<void>(userId, `/account/~/extension/~/ring-out/${encodeURIComponent(id)}`, { method: 'DELETE' })
 }
